@@ -1,410 +1,455 @@
-#!/usr/bin/env bash
-set -euo pipefail
-
-CONFIG_FILE="$HOME/.aws/config"
-CACHE_DIR="$HOME/.cache/aws-config-gen"
-
-# Colors
-bold='\033[1m'
-dim='\033[2m'
-green='\033[32m'
-yellow='\033[33m'
-cyan='\033[36m'
-red='\033[31m'
-reset='\033[0m'
-
-usage() {
-  cat <<'EOF'
-Usage: aws-config-gen [OPTIONS]
-
-Interactive TUI to discover and select AWS SSO profiles for ~/.aws/config.
-Authenticates via SSO, fetches all accounts/roles you have access to,
-and lets you pick which ones to add.
-
-Required:
-  --sso-url URL          SSO start URL (e.g., https://myorg.awsapps.com/start)
-
-Optional:
-  --region REGION        Default region for profiles (default: eu-west-1)
-  --sso-region REGION    SSO region (defaults to --region)
-  --sso-session NAME     SSO session name (enables session-based auth)
-  --output FORMAT        Output format: json|yaml|text (default: json)
-  --new                  Start fresh config (default: append)
-  --dry-run              Print generated config to stdout, don't write
-  --profile-format FMT   Profile naming: {account}-{role}, {name}-{role}, etc.
-                         Placeholders: {account}, {name}, {role}, {email}
-                         (default: {name}-{role})
-  --select-all           Skip TUI, select all discovered profiles
-  --filter PATTERN       Pre-filter accounts (e.g., "prod", "dev-*")
-
-Dependencies: aws-cli v2, jq, fzf
-
-Examples:
-  # Interactive setup for an org
-  aws-config-gen --sso-url https://myorg.awsapps.com/start
-
-  # With session-based auth and custom region
-  aws-config-gen --sso-url https://myorg.awsapps.com/start \
-    --sso-session myorg --sso-region us-east-1
-
-  # Import everything, no TUI
-  aws-config-gen --sso-url https://myorg.awsapps.com/start --select-all
-
-  # Custom profile naming
-  aws-config-gen --sso-url https://myorg.awsapps.com/start \
-    --profile-format "{account}-{role}"
-
-  # Dry run to preview
-  aws-config-gen --sso-url https://myorg.awsapps.com/start --dry-run
-EOF
-  exit 1
-}
-
-check_deps() {
-  local missing=()
-  command -v aws  &>/dev/null || missing+=("aws-cli")
-  command -v jq   &>/dev/null || missing+=("jq")
-  command -v fzf  &>/dev/null || missing+=("fzf")
-  if [[ ${#missing[@]} -gt 0 ]]; then
-    echo -e "${red}Missing dependencies: ${missing[*]}${reset}" >&2
-    echo "Install with: brew install ${missing[*]}" >&2
-    exit 1
-  fi
-}
-
-# Defaults
-SSO_URL=""
-REGION="eu-west-1"
-SSO_REGION=""
-OUTPUT="json"
-SSO_SESSION=""
-NEW_FILE=false
-DRY_RUN=false
-PROFILE_FORMAT="{name}-{role}"
-SELECT_ALL=false
-FILTER=""
-
-while [[ $# -gt 0 ]]; do
-  case $1 in
-    --sso-url)        SSO_URL="$2"; shift 2 ;;
-    --region)         REGION="$2"; shift 2 ;;
-    --sso-region)     SSO_REGION="$2"; shift 2 ;;
-    --output)         OUTPUT="$2"; shift 2 ;;
-    --sso-session)    SSO_SESSION="$2"; shift 2 ;;
-    --new)            NEW_FILE=true; shift ;;
-    --dry-run)        DRY_RUN=true; shift ;;
-    --profile-format) PROFILE_FORMAT="$2"; shift 2 ;;
-    --select-all)     SELECT_ALL=true; shift ;;
-    --filter)         FILTER="$2"; shift 2 ;;
-    -h|--help)        usage ;;
-    *) echo "Unknown option: $1" >&2; usage ;;
-  esac
-done
-
-check_deps
-
-if [[ -z "$SSO_URL" ]]; then
-  echo -e "${red}Error: --sso-url is required${reset}" >&2
-  echo "Run with --help for usage." >&2
-  exit 1
-fi
-
-[[ -z "$SSO_REGION" ]] && SSO_REGION="$REGION"
-
-mkdir -p "$CACHE_DIR"
-
-# ── SSO Device Auth ──────────────────────────────────────────────────
-# Register client and get access token via device authorization flow
-get_access_token() {
-  echo -e "${cyan}Registering SSO client...${reset}" >&2
-
-  local client_reg
-  client_reg=$(aws sso-oidc register-client \
-    --client-name "aws-config-gen" \
-    --client-type "public" \
-    --region "$SSO_REGION" \
-    --output json 2>/dev/null)
-
-  local client_id client_secret
-  client_id=$(echo "$client_reg" | jq -r '.clientId')
-  client_secret=$(echo "$client_reg" | jq -r '.clientSecret')
-
-  echo -e "${cyan}Starting device authorization...${reset}" >&2
-
-  local device_auth
-  device_auth=$(aws sso-oidc start-device-authorization \
-    --client-id "$client_id" \
-    --client-secret "$client_secret" \
-    --start-url "$SSO_URL" \
-    --region "$SSO_REGION" \
-    --output json 2>/dev/null)
-
-  local device_code verification_uri user_code interval
-  device_code=$(echo "$device_auth" | jq -r '.deviceCode')
-  verification_uri=$(echo "$device_auth" | jq -r '.verificationUriComplete')
-  user_code=$(echo "$device_auth" | jq -r '.userCode')
-  interval=$(echo "$device_auth" | jq -r 'if .interval then .interval else 5 end')
-  [[ -z "$interval" || "$interval" == "null" ]] && interval=5
-
-  echo "" >&2
-  echo -e "${bold}Opening browser for SSO login...${reset}" >&2
-  echo -e "${dim}If it doesn't open, visit: ${verification_uri}${reset}" >&2
-  echo -e "${dim}User code: ${user_code}${reset}" >&2
-  echo "" >&2
-
-  open "$verification_uri" 2>/dev/null || true
-
-  echo -e "${yellow}Waiting for authorization...${reset}" >&2
-
-  local token_result
-  while true; do
-    sleep "$interval"
-    token_result=$(aws sso-oidc create-token \
-      --client-id "$client_id" \
-      --client-secret "$client_secret" \
-      --grant-type "urn:ietf:params:oauth:grant-type:device_code" \
-      --device-code "$device_code" \
-      --region "$SSO_REGION" \
-      --output json 2>/dev/null) && break || true
-  done
-
-  echo "$token_result" | jq -r '.accessToken'
-}
-
-ACCESS_TOKEN=$(get_access_token)
-echo -e "${green}Authenticated successfully.${reset}" >&2
-echo "" >&2
-
-# ── Discover Accounts ───────────────────────────────────────────────
-echo -e "${cyan}Fetching accounts...${reset}" >&2
-
-all_accounts="[]"
-next_token=""
-while true; do
-  if [[ -n "$next_token" ]]; then
-    page=$(aws sso list-accounts \
-      --access-token "$ACCESS_TOKEN" \
-      --region "$SSO_REGION" \
-      --next-token "$next_token" \
-      --output json 2>/dev/null)
-  else
-    page=$(aws sso list-accounts \
-      --access-token "$ACCESS_TOKEN" \
-      --region "$SSO_REGION" \
-      --output json 2>/dev/null)
-  fi
-  accounts_page=$(echo "$page" | jq '.accountList')
-  all_accounts=$(echo "$all_accounts $accounts_page" | jq -s 'add')
-  next_token=$(echo "$page" | jq -r '.nextToken // empty')
-  [[ -z "$next_token" ]] && break
-done
-
-account_count=$(echo "$all_accounts" | jq 'length')
-echo -e "${green}Found ${account_count} accounts.${reset}" >&2
-
-# ── Discover Roles per Account ──────────────────────────────────────
-echo -e "${cyan}Fetching roles for each account...${reset}" >&2
-
-# Build a flat list: one entry per account+role combo
-entries_file=$(mktemp)
-echo -n "" > "$entries_file"
-
-echo "$all_accounts" | jq -c '.[]' | while read -r acct; do
-  acct_id=$(echo "$acct" | jq -r '.accountId')
-  acct_name=$(echo "$acct" | jq -r '.accountName')
-  acct_email=$(echo "$acct" | jq -r '.emailAddress')
-
-  roles_json=$(aws sso list-account-roles \
-    --access-token "$ACCESS_TOKEN" \
-    --account-id "$acct_id" \
-    --region "$SSO_REGION" \
-    --output json 2>/dev/null)
-
-  echo "$roles_json" | jq -c '.roleList[]' | while read -r role; do
-    role_name=$(echo "$role" | jq -r '.roleName')
-    echo "$acct_id|$acct_name|$acct_email|$role_name" >> "$entries_file"
-  done
-done
-
-total=$(wc -l < "$entries_file" | tr -d ' ')
-echo -e "${green}Found ${total} account/role combinations.${reset}" >&2
-echo "" >&2
-
-if [[ "$total" -eq 0 ]]; then
-  echo -e "${red}No accounts/roles found. Check your SSO permissions.${reset}" >&2
-  rm -f "$entries_file"
-  exit 1
-fi
-
-# ── Apply pre-filter ────────────────────────────────────────────────
-if [[ -n "$FILTER" ]]; then
-  filtered_file=$(mktemp)
-  grep -i "$FILTER" "$entries_file" > "$filtered_file" || true
-  filtered_count=$(wc -l < "$filtered_file" | tr -d ' ')
-  echo -e "${dim}Filter '${FILTER}' matched ${filtered_count}/${total} entries.${reset}" >&2
-  mv "$filtered_file" "$entries_file"
-  total=$filtered_count
-fi
-
-# ── Profile name generation ─────────────────────────────────────────
-sanitize() {
-  echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | sed 's/--*/-/g' | sed 's/^-//;s/-$//'
-}
-
-make_profile_name() {
-  local acct_id="$1" acct_name="$2" acct_email="$3" role_name="$4"
-  local name="$PROFILE_FORMAT"
-  name="${name//\{account\}/$(sanitize "$acct_id")}"
-  name="${name//\{name\}/$(sanitize "$acct_name")}"
-  name="${name//\{email\}/$(sanitize "$acct_email")}"
-  name="${name//\{role\}/$(sanitize "$role_name")}"
-  echo "$name"
-}
-
-# ── TUI Selection ───────────────────────────────────────────────────
-if $SELECT_ALL; then
-  selected_file="$entries_file"
-else
-  # Build display lines for fzf
-  display_file=$(mktemp)
-  while IFS='|' read -r acct_id acct_name acct_email role_name; do
-    profile=$(make_profile_name "$acct_id" "$acct_name" "$acct_email" "$role_name")
-    printf "%-40s  %-14s  %-30s  %s\n" "$acct_name" "$acct_id" "$role_name" "$profile" >> "$display_file"
-  done < "$entries_file"
-
-  echo -e "${bold}Select profiles to add (TAB to toggle, ENTER to confirm):${reset}" >&2
-
-  # fzf multi-select
-  selected_indices_file=$(mktemp)
-  header="ACCOUNT NAME                              ACCOUNT ID      ROLE                            PROFILE NAME"
-
-  # Use paste to add line numbers, then fzf, then extract indices
-  paste -d'|' <(seq 1 "$total") "$display_file" | \
-    fzf --multi \
-        --header "$header" \
-        --prompt "Filter > " \
-        --preview-window hidden \
-        --bind 'ctrl-a:select-all,ctrl-d:deselect-all' \
-        --height '80%' \
-        --reverse \
-        --delimiter '|' \
-        --with-nth 2 \
-    | cut -d'|' -f1 > "$selected_indices_file" || true
-
-  selected_count=$(wc -l < "$selected_indices_file" | tr -d ' ')
-  if [[ "$selected_count" -eq 0 ]]; then
-    echo -e "${yellow}No profiles selected. Exiting.${reset}" >&2
-    rm -f "$entries_file" "$display_file" "$selected_indices_file"
-    exit 0
-  fi
-
-  # Extract selected entries
-  selected_file=$(mktemp)
-  while read -r idx; do
-    sed -n "${idx}p" "$entries_file" >> "$selected_file"
-  done < "$selected_indices_file"
-
-  echo "" >&2
-  echo -e "${green}Selected ${selected_count} profiles.${reset}" >&2
-  rm -f "$display_file" "$selected_indices_file"
-fi
-
-# ── Generate Config ─────────────────────────────────────────────────
-config_output=""
-
-# SSO session block (if using session-based auth)
-if [[ -n "$SSO_SESSION" ]]; then
-  config_output+="[sso-session ${SSO_SESSION}]
-sso_start_url = ${SSO_URL}
-sso_region = ${SSO_REGION}
-sso_registration_scopes = sso:account:access
-"
-fi
-
-while IFS='|' read -r acct_id acct_name acct_email role_name; do
-  profile=$(make_profile_name "$acct_id" "$acct_name" "$acct_email" "$role_name")
-
-  config_output+="
-[profile ${profile}]
-sso_account_id = ${acct_id}
-sso_role_name = ${role_name}
-region = ${REGION}
-output = ${OUTPUT}"
-
-  if [[ -n "$SSO_SESSION" ]]; then
-    config_output+="
-sso_session = ${SSO_SESSION}"
-  else
-    config_output+="
-sso_start_url = ${SSO_URL}
-sso_region = ${SSO_REGION}"
-  fi
-  config_output+="
-"
-done < "$selected_file"
-
-# Trim leading newline
-config_output=$(echo "$config_output" | sed '/./,$!d')
-
-# ── Write or Print ──────────────────────────────────────────────────
-if $DRY_RUN; then
-  echo ""
-  echo -e "${bold}── Generated Config ──${reset}"
-  echo "$config_output"
-  echo ""
-  rm -f "$entries_file" "$selected_file" 2>/dev/null
-  exit 0
-fi
-
-mkdir -p "$(dirname "$CONFIG_FILE")"
-
-if $NEW_FILE; then
-  if [[ -f "$CONFIG_FILE" ]]; then
-    backup="${CONFIG_FILE}.bak.$(date +%s)"
-    cp "$CONFIG_FILE" "$backup"
-    echo -e "${dim}Backed up existing config to ${backup}${reset}" >&2
-  fi
-  echo "$config_output" > "$CONFIG_FILE"
-  echo -e "${green}Created ${CONFIG_FILE}${reset}" >&2
-else
-  # Remove duplicates before appending
-  while IFS='|' read -r acct_id acct_name acct_email role_name; do
-    profile=$(make_profile_name "$acct_id" "$acct_name" "$acct_email" "$role_name")
-    if [[ -f "$CONFIG_FILE" ]] && grep -q "^\[profile ${profile}\]" "$CONFIG_FILE"; then
-      echo -e "${yellow}Replacing existing profile: ${profile}${reset}" >&2
-      tmp=$(mktemp)
-      awk -v prof="[profile ${profile}]" '
-        $0 == prof { skip=1; next }
-        /^\[/ { skip=0 }
-        !skip { print }
-      ' "$CONFIG_FILE" > "$tmp"
-      mv "$tmp" "$CONFIG_FILE"
-    fi
-  done < "$selected_file"
-
-  # Also handle sso-session dedup
-  if [[ -n "$SSO_SESSION" && -f "$CONFIG_FILE" ]] && grep -q "^\[sso-session ${SSO_SESSION}\]" "$CONFIG_FILE"; then
-    tmp=$(mktemp)
-    awk -v sess="[sso-session ${SSO_SESSION}]" '
-      $0 == sess { skip=1; next }
-      /^\[/ { skip=0 }
-      !skip { print }
-    ' "$CONFIG_FILE" > "$tmp"
-    mv "$tmp" "$CONFIG_FILE"
-  fi
-
-  if [[ -f "$CONFIG_FILE" && -s "$CONFIG_FILE" ]]; then
-    echo "" >> "$CONFIG_FILE"
-  fi
-  echo "$config_output" >> "$CONFIG_FILE"
-  echo -e "${green}Appended to ${CONFIG_FILE}${reset}" >&2
-fi
-
-selected_count=$(wc -l < "$selected_file" | tr -d ' ')
-echo -e "${green}${bold}Done! Added ${selected_count} profiles.${reset}" >&2
-echo "" >&2
-echo -e "${dim}To login:  aws sso login --profile <profile-name>${reset}" >&2
-echo -e "${dim}To list:   grep '^\[profile' ~/.aws/config${reset}" >&2
-
-# Cleanup
-rm -f "$entries_file" "$selected_file" 2>/dev/null
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["boto3", "certifi"]
+# ///
+"""aws-config-gen: Interactive TUI to discover and generate ~/.aws/config from AWS SSO."""
+
+import argparse
+import concurrent.futures
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import webbrowser
+
+import boto3
+
+# ── Colors ──────────────────────────────────────────────────────────
+class C:
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    GREEN = "\033[32m"
+    YELLOW = "\033[33m"
+    CYAN = "\033[36m"
+    RED = "\033[31m"
+    RESET = "\033[0m"
+
+def info(msg): print(f"{C.CYAN}{msg}{C.RESET}", file=sys.stderr)
+def success(msg): print(f"{C.GREEN}{msg}{C.RESET}", file=sys.stderr)
+def warn(msg): print(f"{C.YELLOW}{msg}{C.RESET}", file=sys.stderr)
+def error(msg): print(f"{C.RED}{msg}{C.RESET}", file=sys.stderr)
+def dim(msg): print(f"{C.DIM}{msg}{C.RESET}", file=sys.stderr)
+def bold(msg): print(f"{C.BOLD}{msg}{C.RESET}", file=sys.stderr)
+
+
+# ── SSO Region Detection ────────────────────────────────────────────
+def detect_sso_region(sso_url: str) -> str | None:
+    """Detect the SSO region by inspecting the portal's response headers.
+    The Link header contains the SSO portal URL with the region embedded."""
+    import ssl
+    import urllib.request
+
+    try:
+        import certifi
+        ctx = ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        ctx = ssl.create_default_context()
+
+    # Try with default certs, then unverified as fallback (just reading headers)
+    for ssl_ctx in [ctx, ssl._create_unverified_context()]:
+        try:
+            req = urllib.request.Request(sso_url, method="HEAD")
+            resp = urllib.request.urlopen(req, context=ssl_ctx, timeout=10)
+            link = resp.headers.get("Link", "")
+            csp = resp.headers.get("Content-Security-Policy", "")
+            for header_val in [link, csp]:
+                match = re.search(r"portal\.sso\.([a-z0-9-]+)\.amazonaws\.com", header_val)
+                if match:
+                    return match.group(1)
+        except ssl.SSLError:
+            continue
+        except Exception:
+            break
+    return None
+
+
+# ── SSO Auth ────────────────────────────────────────────────────────
+def get_access_token(sso_url: str, sso_region: str) -> str:
+    oidc = boto3.client("sso-oidc", region_name=sso_region)
+
+    info("Registering SSO client...")
+    client = oidc.register_client(clientName="aws-config-gen", clientType="public")
+    client_id = client["clientId"]
+    client_secret = client["clientSecret"]
+
+    info("Starting device authorization...")
+    device_auth = oidc.start_device_authorization(
+        clientId=client_id,
+        clientSecret=client_secret,
+        startUrl=sso_url,
+    )
+
+    device_code = device_auth["deviceCode"]
+    user_code = device_auth.get("userCode", "")
+    verification_uri = device_auth.get("verificationUriComplete") or device_auth.get("verificationUri", "")
+    interval = device_auth.get("interval", 5) or 5
+
+    if not verification_uri:
+        error("Failed to get verification URI from SSO")
+        error(f"Response: {device_auth}")
+        sys.exit(1)
+
+    print(file=sys.stderr)
+    bold("Opening browser for SSO login...")
+    dim(f"URL:  {verification_uri}")
+    if user_code:
+        dim(f"Code: {user_code}")
+    print(file=sys.stderr)
+
+    webbrowser.open(verification_uri)
+    warn("Waiting for authorization (approve in browser)...")
+
+    for attempt in range(120):
+        time.sleep(interval)
+        try:
+            token = oidc.create_token(
+                clientId=client_id,
+                clientSecret=client_secret,
+                grantType="urn:ietf:params:oauth:grant-type:device_code",
+                deviceCode=device_code,
+            )
+            return token["accessToken"]
+        except oidc.exceptions.AuthorizationPendingException:
+            continue
+        except oidc.exceptions.SlowDownException:
+            interval += 1
+            continue
+        except Exception as e:
+            error(f"Token error: {e}")
+            sys.exit(1)
+
+    error("Timed out waiting for authorization")
+    sys.exit(1)
+
+
+# ── Account/Role Discovery ─────────────────────────────────────────
+def fetch_all_accounts(access_token: str, sso_region: str) -> list[dict]:
+    sso = boto3.client("sso", region_name=sso_region)
+    accounts = []
+    paginator = sso.get_paginator("list_accounts")
+    for page in paginator.paginate(accessToken=access_token):
+        accounts.extend(page.get("accountList", []))
+    return accounts
+
+
+def fetch_roles_for_account(access_token: str, sso_region: str, account: dict) -> list[dict]:
+    sso = boto3.client("sso", region_name=sso_region)
+    acct_id = account["accountId"]
+    acct_name = account.get("accountName", acct_id)
+    acct_email = account.get("emailAddress", "")
+    entries = []
+    try:
+        paginator = sso.get_paginator("list_account_roles")
+        for page in paginator.paginate(accessToken=access_token, accountId=acct_id):
+            for role in page.get("roleList", []):
+                entries.append({
+                    "account_id": acct_id,
+                    "account_name": acct_name,
+                    "email": acct_email,
+                    "role_name": role["roleName"],
+                })
+    except Exception:
+        pass  # skip accounts we can't list roles for
+    return entries
+
+
+def discover_roles(access_token: str, sso_region: str, accounts: list[dict]) -> list[dict]:
+    entries = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as pool:
+        futures = {
+            pool.submit(fetch_roles_for_account, access_token, sso_region, acct): acct
+            for acct in accounts
+        }
+        done = 0
+        total = len(futures)
+        for future in concurrent.futures.as_completed(futures):
+            done += 1
+            print(f"\r{C.DIM}  [{done}/{total}]{C.RESET}", end="", file=sys.stderr)
+            entries.extend(future.result())
+    print(file=sys.stderr)
+    return entries
+
+
+# ── Profile Naming ──────────────────────────────────────────────────
+def sanitize(s: str) -> str:
+    s = s.lower()
+    s = re.sub(r"[^a-z0-9-]", "-", s)
+    s = re.sub(r"-+", "-", s)
+    return s.strip("-")
+
+
+def make_profile_name(entry: dict, fmt: str) -> str:
+    name = fmt
+    name = name.replace("{account}", sanitize(entry["account_id"]))
+    name = name.replace("{name}", sanitize(entry["account_name"]))
+    name = name.replace("{email}", sanitize(entry["email"]))
+    name = name.replace("{role}", sanitize(entry["role_name"]))
+    return name
+
+
+# ── TUI Selection (fzf) ────────────────────────────────────────────
+def fzf_select(entries: list[dict], profile_format: str) -> list[dict]:
+    if not shutil.which("fzf"):
+        error("fzf is required for interactive selection. Install with: brew install fzf")
+        error("Or use --select-all to skip the TUI.")
+        sys.exit(1)
+
+    lines = []
+    for i, e in enumerate(entries):
+        profile = make_profile_name(e, profile_format)
+        line = f"{i}\t{e['account_name']:<40}  {e['account_id']:<14}  {e['role_name']:<30}  {profile}"
+        lines.append(line)
+
+    header = f"{'ACCOUNT NAME':<40}  {'ACCOUNT ID':<14}  {'ROLE':<30}  PROFILE NAME"
+    input_text = "\n".join(lines)
+
+    bold("Select profiles to add (TAB to toggle, ENTER to confirm):")
+
+    try:
+        result = subprocess.run(
+            [
+                "fzf", "--multi",
+                "--header", header,
+                "--prompt", "Filter > ",
+                "--preview-window", "hidden",
+                "--bind", "ctrl-a:select-all,ctrl-d:deselect-all",
+                "--height", "80%",
+                "--reverse",
+                "--delimiter", "\t",
+                "--with-nth", "2",
+            ],
+            input=input_text,
+            capture_output=True,
+            text=True,
+        )
+    except KeyboardInterrupt:
+        warn("Cancelled.")
+        sys.exit(0)
+
+    if result.returncode != 0 or not result.stdout.strip():
+        warn("No profiles selected. Exiting.")
+        sys.exit(0)
+
+    selected_indices = []
+    for line in result.stdout.strip().split("\n"):
+        idx = int(line.split("\t")[0])
+        selected_indices.append(idx)
+
+    return [entries[i] for i in selected_indices]
+
+
+# ── Config Generation ──────────────────────────────────────────────
+def generate_config(
+    entries: list[dict],
+    profile_format: str,
+    sso_url: str,
+    sso_region: str,
+    region: str,
+    output_format: str,
+    sso_session: str | None,
+) -> str:
+    blocks = []
+
+    if sso_session:
+        blocks.append(
+            f"[sso-session {sso_session}]\n"
+            f"sso_start_url = {sso_url}\n"
+            f"sso_region = {sso_region}\n"
+            f"sso_registration_scopes = sso:account:access"
+        )
+
+    for entry in entries:
+        profile = make_profile_name(entry, profile_format)
+        block = (
+            f"[profile {profile}]\n"
+            f"sso_account_id = {entry['account_id']}\n"
+            f"sso_role_name = {entry['role_name']}\n"
+            f"region = {region}\n"
+            f"output = {output_format}"
+        )
+        if sso_session:
+            block += f"\nsso_session = {sso_session}"
+        else:
+            block += f"\nsso_start_url = {sso_url}\nsso_region = {sso_region}"
+        blocks.append(block)
+
+    return "\n\n".join(blocks) + "\n"
+
+
+# ── Config Writing ─────────────────────────────────────────────────
+def remove_existing_section(config_text: str, section_header: str) -> str:
+    """Remove a section (from header to next header or EOF) from config text."""
+    lines = config_text.split("\n")
+    result = []
+    skip = False
+    for line in lines:
+        if line.strip() == section_header:
+            skip = True
+            continue
+        if line.startswith("[") and skip:
+            skip = False
+        if not skip:
+            result.append(line)
+    return "\n".join(result)
+
+
+def write_config(
+    config_output: str,
+    config_file: str,
+    new_file: bool,
+    entries: list[dict],
+    profile_format: str,
+    sso_session: str | None,
+):
+    os.makedirs(os.path.dirname(config_file), exist_ok=True)
+
+    if new_file:
+        if os.path.exists(config_file):
+            backup = f"{config_file}.bak.{int(time.time())}"
+            shutil.copy2(config_file, backup)
+            dim(f"Backed up existing config to {backup}")
+        with open(config_file, "w") as f:
+            f.write(config_output)
+        success(f"Created {config_file}")
+    else:
+        existing = ""
+        if os.path.exists(config_file):
+            with open(config_file) as f:
+                existing = f.read()
+
+        # Remove duplicate profiles
+        for entry in entries:
+            profile = make_profile_name(entry, profile_format)
+            header = f"[profile {profile}]"
+            if header in existing:
+                warn(f"Replacing existing profile: {profile}")
+                existing = remove_existing_section(existing, header)
+
+        # Remove duplicate sso-session
+        if sso_session:
+            session_header = f"[sso-session {sso_session}]"
+            if session_header in existing:
+                existing = remove_existing_section(existing, session_header)
+
+        # Clean up trailing whitespace and append
+        existing = existing.rstrip()
+        if existing:
+            existing += "\n\n"
+        with open(config_file, "w") as f:
+            f.write(existing + config_output)
+        success(f"Appended to {config_file}")
+
+
+# ── Main ───────────────────────────────────────────────────────────
+def main():
+    parser = argparse.ArgumentParser(
+        prog="aws-config-gen",
+        description="Interactive TUI to discover and generate ~/.aws/config from AWS SSO.",
+    )
+    parser.add_argument("--sso-url", required=True, help="SSO start URL")
+    parser.add_argument("--region", default="eu-west-1", help="Default region (default: eu-west-1)")
+    parser.add_argument("--sso-region", default=None, help="SSO region (defaults to --region)")
+    parser.add_argument("--sso-session", default=None, help="SSO session name")
+    parser.add_argument("--output", default="json", help="Output format (default: json)")
+    parser.add_argument("--profile-format", default="{name}-{role}",
+                        help="Profile naming: {name}, {account}, {role}, {email} (default: {name}-{role})")
+    parser.add_argument("--new", action="store_true", help="Overwrite existing config (backs up first)")
+    parser.add_argument("--dry-run", action="store_true", help="Print config to stdout only")
+    parser.add_argument("--select-all", action="store_true", help="Skip TUI, select all profiles")
+    parser.add_argument("--filter", default=None, help="Pre-filter accounts by pattern")
+
+    args = parser.parse_args()
+    sso_url = args.sso_url.rstrip("/")
+    config_file = os.path.expanduser("~/.aws/config")
+
+    # Auto-detect SSO region if not provided
+    if args.sso_region:
+        sso_region = args.sso_region
+    else:
+        info("Detecting SSO region...")
+        detected = detect_sso_region(sso_url)
+        if detected:
+            sso_region = detected
+            success(f"Detected SSO region: {sso_region}")
+        else:
+            sso_region = args.region
+            warn(f"Could not detect SSO region, using: {sso_region}")
+
+    # Authenticate
+    access_token = get_access_token(sso_url, sso_region)
+    success("Authenticated successfully.")
+    print(file=sys.stderr)
+
+    # Discover accounts
+    info("Fetching accounts...")
+    accounts = fetch_all_accounts(access_token, sso_region)
+    success(f"Found {len(accounts)} accounts.")
+
+    if not accounts:
+        error("No accounts found. Check your SSO permissions.")
+        sys.exit(1)
+
+    # Discover roles (parallel)
+    info("Fetching roles for each account...")
+    entries = discover_roles(access_token, sso_region, accounts)
+    success(f"Found {len(entries)} account/role combinations.")
+    print(file=sys.stderr)
+
+    if not entries:
+        error("No roles found. Check your SSO permissions.")
+        sys.exit(1)
+
+    # Apply filter
+    if args.filter:
+        pattern = args.filter.lower()
+        filtered = [e for e in entries if pattern in e["account_name"].lower()
+                    or pattern in e["account_id"]
+                    or pattern in e["role_name"].lower()]
+        dim(f"Filter '{args.filter}' matched {len(filtered)}/{len(entries)} entries.")
+        entries = filtered
+        if not entries:
+            error("No entries match filter.")
+            sys.exit(1)
+
+    # Sort by account name then role
+    entries.sort(key=lambda e: (e["account_name"].lower(), e["role_name"].lower()))
+
+    # Select
+    if args.select_all:
+        selected = entries
+    else:
+        selected = fzf_select(entries, args.profile_format)
+
+    success(f"Selected {len(selected)} profiles.")
+    print(file=sys.stderr)
+
+    # Generate config
+    config_output = generate_config(
+        selected,
+        args.profile_format,
+        sso_url,
+        sso_region,
+        args.region,
+        args.output,
+        args.sso_session,
+    )
+
+    if args.dry_run:
+        bold("── Generated Config ──")
+        print(config_output)
+        return
+
+    write_config(config_output, config_file, args.new, selected, args.profile_format, args.sso_session)
+
+    count = len(selected)
+    success(f"Done! Added {count} profiles.")
+    print(file=sys.stderr)
+    dim(f"To login:  aws sso login --profile <profile-name>")
+    dim(r"To list:   grep '^\[profile' ~/.aws/config")
+
+
+if __name__ == "__main__":
+    main()
