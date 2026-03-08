@@ -1,0 +1,409 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONFIG_FILE="$HOME/.aws/config"
+CACHE_DIR="$HOME/.cache/aws-config-gen"
+
+# Colors
+bold='\033[1m'
+dim='\033[2m'
+green='\033[32m'
+yellow='\033[33m'
+cyan='\033[36m'
+red='\033[31m'
+reset='\033[0m'
+
+usage() {
+  cat <<'EOF'
+Usage: aws-config-gen [OPTIONS]
+
+Interactive TUI to discover and select AWS SSO profiles for ~/.aws/config.
+Authenticates via SSO, fetches all accounts/roles you have access to,
+and lets you pick which ones to add.
+
+Required:
+  --sso-url URL          SSO start URL (e.g., https://myorg.awsapps.com/start)
+
+Optional:
+  --region REGION        Default region for profiles (default: eu-west-1)
+  --sso-region REGION    SSO region (defaults to --region)
+  --sso-session NAME     SSO session name (enables session-based auth)
+  --output FORMAT        Output format: json|yaml|text (default: json)
+  --new                  Start fresh config (default: append)
+  --dry-run              Print generated config to stdout, don't write
+  --profile-format FMT   Profile naming: {account}-{role}, {name}-{role}, etc.
+                         Placeholders: {account}, {name}, {role}, {email}
+                         (default: {name}-{role})
+  --select-all           Skip TUI, select all discovered profiles
+  --filter PATTERN       Pre-filter accounts (e.g., "prod", "dev-*")
+
+Dependencies: aws-cli v2, jq, fzf
+
+Examples:
+  # Interactive setup for an org
+  aws-config-gen --sso-url https://myorg.awsapps.com/start
+
+  # With session-based auth and custom region
+  aws-config-gen --sso-url https://myorg.awsapps.com/start \
+    --sso-session myorg --sso-region us-east-1
+
+  # Import everything, no TUI
+  aws-config-gen --sso-url https://myorg.awsapps.com/start --select-all
+
+  # Custom profile naming
+  aws-config-gen --sso-url https://myorg.awsapps.com/start \
+    --profile-format "{account}-{role}"
+
+  # Dry run to preview
+  aws-config-gen --sso-url https://myorg.awsapps.com/start --dry-run
+EOF
+  exit 1
+}
+
+check_deps() {
+  local missing=()
+  command -v aws  &>/dev/null || missing+=("aws-cli")
+  command -v jq   &>/dev/null || missing+=("jq")
+  command -v fzf  &>/dev/null || missing+=("fzf")
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    echo -e "${red}Missing dependencies: ${missing[*]}${reset}" >&2
+    echo "Install with: brew install ${missing[*]}" >&2
+    exit 1
+  fi
+}
+
+# Defaults
+SSO_URL=""
+REGION="eu-west-1"
+SSO_REGION=""
+OUTPUT="json"
+SSO_SESSION=""
+NEW_FILE=false
+DRY_RUN=false
+PROFILE_FORMAT="{name}-{role}"
+SELECT_ALL=false
+FILTER=""
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --sso-url)        SSO_URL="$2"; shift 2 ;;
+    --region)         REGION="$2"; shift 2 ;;
+    --sso-region)     SSO_REGION="$2"; shift 2 ;;
+    --output)         OUTPUT="$2"; shift 2 ;;
+    --sso-session)    SSO_SESSION="$2"; shift 2 ;;
+    --new)            NEW_FILE=true; shift ;;
+    --dry-run)        DRY_RUN=true; shift ;;
+    --profile-format) PROFILE_FORMAT="$2"; shift 2 ;;
+    --select-all)     SELECT_ALL=true; shift ;;
+    --filter)         FILTER="$2"; shift 2 ;;
+    -h|--help)        usage ;;
+    *) echo "Unknown option: $1" >&2; usage ;;
+  esac
+done
+
+check_deps
+
+if [[ -z "$SSO_URL" ]]; then
+  echo -e "${red}Error: --sso-url is required${reset}" >&2
+  echo "Run with --help for usage." >&2
+  exit 1
+fi
+
+[[ -z "$SSO_REGION" ]] && SSO_REGION="$REGION"
+
+mkdir -p "$CACHE_DIR"
+
+# ── SSO Device Auth ──────────────────────────────────────────────────
+# Register client and get access token via device authorization flow
+get_access_token() {
+  echo -e "${cyan}Registering SSO client...${reset}" >&2
+
+  local client_reg
+  client_reg=$(aws sso-oidc register-client \
+    --client-name "aws-config-gen" \
+    --client-type "public" \
+    --region "$SSO_REGION" \
+    --output json 2>/dev/null)
+
+  local client_id client_secret
+  client_id=$(echo "$client_reg" | jq -r '.clientId')
+  client_secret=$(echo "$client_reg" | jq -r '.clientSecret')
+
+  echo -e "${cyan}Starting device authorization...${reset}" >&2
+
+  local device_auth
+  device_auth=$(aws sso-oidc start-device-authorization \
+    --client-id "$client_id" \
+    --client-secret "$client_secret" \
+    --start-url "$SSO_URL" \
+    --region "$SSO_REGION" \
+    --output json 2>/dev/null)
+
+  local device_code verification_uri user_code interval
+  device_code=$(echo "$device_auth" | jq -r '.deviceCode')
+  verification_uri=$(echo "$device_auth" | jq -r '.verificationUriComplete')
+  user_code=$(echo "$device_auth" | jq -r '.userCode')
+  interval=$(echo "$device_auth" | jq -r '.interval // 5')
+
+  echo "" >&2
+  echo -e "${bold}Opening browser for SSO login...${reset}" >&2
+  echo -e "${dim}If it doesn't open, visit: ${verification_uri}${reset}" >&2
+  echo -e "${dim}User code: ${user_code}${reset}" >&2
+  echo "" >&2
+
+  open "$verification_uri" 2>/dev/null || true
+
+  echo -e "${yellow}Waiting for authorization...${reset}" >&2
+
+  local token_result
+  while true; do
+    sleep "$interval"
+    token_result=$(aws sso-oidc create-token \
+      --client-id "$client_id" \
+      --client-secret "$client_secret" \
+      --grant-type "urn:ietf:params:oauth:grant-type:device_code" \
+      --device-code "$device_code" \
+      --region "$SSO_REGION" \
+      --output json 2>/dev/null) && break || true
+  done
+
+  echo "$token_result" | jq -r '.accessToken'
+}
+
+ACCESS_TOKEN=$(get_access_token)
+echo -e "${green}Authenticated successfully.${reset}" >&2
+echo "" >&2
+
+# ── Discover Accounts ───────────────────────────────────────────────
+echo -e "${cyan}Fetching accounts...${reset}" >&2
+
+all_accounts="[]"
+next_token=""
+while true; do
+  if [[ -n "$next_token" ]]; then
+    page=$(aws sso list-accounts \
+      --access-token "$ACCESS_TOKEN" \
+      --region "$SSO_REGION" \
+      --next-token "$next_token" \
+      --output json 2>/dev/null)
+  else
+    page=$(aws sso list-accounts \
+      --access-token "$ACCESS_TOKEN" \
+      --region "$SSO_REGION" \
+      --output json 2>/dev/null)
+  fi
+  accounts_page=$(echo "$page" | jq '.accountList')
+  all_accounts=$(echo "$all_accounts $accounts_page" | jq -s 'add')
+  next_token=$(echo "$page" | jq -r '.nextToken // empty')
+  [[ -z "$next_token" ]] && break
+done
+
+account_count=$(echo "$all_accounts" | jq 'length')
+echo -e "${green}Found ${account_count} accounts.${reset}" >&2
+
+# ── Discover Roles per Account ──────────────────────────────────────
+echo -e "${cyan}Fetching roles for each account...${reset}" >&2
+
+# Build a flat list: one entry per account+role combo
+entries_file=$(mktemp)
+echo -n "" > "$entries_file"
+
+echo "$all_accounts" | jq -c '.[]' | while read -r acct; do
+  acct_id=$(echo "$acct" | jq -r '.accountId')
+  acct_name=$(echo "$acct" | jq -r '.accountName')
+  acct_email=$(echo "$acct" | jq -r '.emailAddress')
+
+  roles_json=$(aws sso list-account-roles \
+    --access-token "$ACCESS_TOKEN" \
+    --account-id "$acct_id" \
+    --region "$SSO_REGION" \
+    --output json 2>/dev/null)
+
+  echo "$roles_json" | jq -c '.roleList[]' | while read -r role; do
+    role_name=$(echo "$role" | jq -r '.roleName')
+    echo "$acct_id|$acct_name|$acct_email|$role_name" >> "$entries_file"
+  done
+done
+
+total=$(wc -l < "$entries_file" | tr -d ' ')
+echo -e "${green}Found ${total} account/role combinations.${reset}" >&2
+echo "" >&2
+
+if [[ "$total" -eq 0 ]]; then
+  echo -e "${red}No accounts/roles found. Check your SSO permissions.${reset}" >&2
+  rm -f "$entries_file"
+  exit 1
+fi
+
+# ── Apply pre-filter ────────────────────────────────────────────────
+if [[ -n "$FILTER" ]]; then
+  filtered_file=$(mktemp)
+  grep -i "$FILTER" "$entries_file" > "$filtered_file" || true
+  filtered_count=$(wc -l < "$filtered_file" | tr -d ' ')
+  echo -e "${dim}Filter '${FILTER}' matched ${filtered_count}/${total} entries.${reset}" >&2
+  mv "$filtered_file" "$entries_file"
+  total=$filtered_count
+fi
+
+# ── Profile name generation ─────────────────────────────────────────
+sanitize() {
+  echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | sed 's/--*/-/g' | sed 's/^-//;s/-$//'
+}
+
+make_profile_name() {
+  local acct_id="$1" acct_name="$2" acct_email="$3" role_name="$4"
+  local name="$PROFILE_FORMAT"
+  name="${name//\{account\}/$(sanitize "$acct_id")}"
+  name="${name//\{name\}/$(sanitize "$acct_name")}"
+  name="${name//\{email\}/$(sanitize "$acct_email")}"
+  name="${name//\{role\}/$(sanitize "$role_name")}"
+  echo "$name"
+}
+
+# ── TUI Selection ───────────────────────────────────────────────────
+if $SELECT_ALL; then
+  selected_file="$entries_file"
+else
+  # Build display lines for fzf
+  display_file=$(mktemp)
+  while IFS='|' read -r acct_id acct_name acct_email role_name; do
+    profile=$(make_profile_name "$acct_id" "$acct_name" "$acct_email" "$role_name")
+    printf "%-40s  %-14s  %-30s  %s\n" "$acct_name" "$acct_id" "$role_name" "$profile" >> "$display_file"
+  done < "$entries_file"
+
+  echo -e "${bold}Select profiles to add (TAB to toggle, ENTER to confirm):${reset}" >&2
+
+  # fzf multi-select
+  selected_indices_file=$(mktemp)
+  header="ACCOUNT NAME                              ACCOUNT ID      ROLE                            PROFILE NAME"
+
+  # Use paste to add line numbers, then fzf, then extract indices
+  paste -d'|' <(seq 1 "$total") "$display_file" | \
+    fzf --multi \
+        --header "$header" \
+        --prompt "Filter > " \
+        --preview-window hidden \
+        --bind 'ctrl-a:select-all,ctrl-d:deselect-all' \
+        --height '80%' \
+        --reverse \
+        --delimiter '|' \
+        --with-nth 2 \
+    | cut -d'|' -f1 > "$selected_indices_file" || true
+
+  selected_count=$(wc -l < "$selected_indices_file" | tr -d ' ')
+  if [[ "$selected_count" -eq 0 ]]; then
+    echo -e "${yellow}No profiles selected. Exiting.${reset}" >&2
+    rm -f "$entries_file" "$display_file" "$selected_indices_file"
+    exit 0
+  fi
+
+  # Extract selected entries
+  selected_file=$(mktemp)
+  while read -r idx; do
+    sed -n "${idx}p" "$entries_file" >> "$selected_file"
+  done < "$selected_indices_file"
+
+  echo "" >&2
+  echo -e "${green}Selected ${selected_count} profiles.${reset}" >&2
+  rm -f "$display_file" "$selected_indices_file"
+fi
+
+# ── Generate Config ─────────────────────────────────────────────────
+config_output=""
+
+# SSO session block (if using session-based auth)
+if [[ -n "$SSO_SESSION" ]]; then
+  config_output+="[sso-session ${SSO_SESSION}]
+sso_start_url = ${SSO_URL}
+sso_region = ${SSO_REGION}
+sso_registration_scopes = sso:account:access
+"
+fi
+
+while IFS='|' read -r acct_id acct_name acct_email role_name; do
+  profile=$(make_profile_name "$acct_id" "$acct_name" "$acct_email" "$role_name")
+
+  config_output+="
+[profile ${profile}]
+sso_account_id = ${acct_id}
+sso_role_name = ${role_name}
+region = ${REGION}
+output = ${OUTPUT}"
+
+  if [[ -n "$SSO_SESSION" ]]; then
+    config_output+="
+sso_session = ${SSO_SESSION}"
+  else
+    config_output+="
+sso_start_url = ${SSO_URL}
+sso_region = ${SSO_REGION}"
+  fi
+  config_output+="
+"
+done < "$selected_file"
+
+# Trim leading newline
+config_output=$(echo "$config_output" | sed '/./,$!d')
+
+# ── Write or Print ──────────────────────────────────────────────────
+if $DRY_RUN; then
+  echo ""
+  echo -e "${bold}── Generated Config ──${reset}"
+  echo "$config_output"
+  echo ""
+  rm -f "$entries_file" "$selected_file" 2>/dev/null
+  exit 0
+fi
+
+mkdir -p "$(dirname "$CONFIG_FILE")"
+
+if $NEW_FILE; then
+  if [[ -f "$CONFIG_FILE" ]]; then
+    backup="${CONFIG_FILE}.bak.$(date +%s)"
+    cp "$CONFIG_FILE" "$backup"
+    echo -e "${dim}Backed up existing config to ${backup}${reset}" >&2
+  fi
+  echo "$config_output" > "$CONFIG_FILE"
+  echo -e "${green}Created ${CONFIG_FILE}${reset}" >&2
+else
+  # Remove duplicates before appending
+  while IFS='|' read -r acct_id acct_name acct_email role_name; do
+    profile=$(make_profile_name "$acct_id" "$acct_name" "$acct_email" "$role_name")
+    if [[ -f "$CONFIG_FILE" ]] && grep -q "^\[profile ${profile}\]" "$CONFIG_FILE"; then
+      echo -e "${yellow}Replacing existing profile: ${profile}${reset}" >&2
+      tmp=$(mktemp)
+      awk -v prof="[profile ${profile}]" '
+        $0 == prof { skip=1; next }
+        /^\[/ { skip=0 }
+        !skip { print }
+      ' "$CONFIG_FILE" > "$tmp"
+      mv "$tmp" "$CONFIG_FILE"
+    fi
+  done < "$selected_file"
+
+  # Also handle sso-session dedup
+  if [[ -n "$SSO_SESSION" && -f "$CONFIG_FILE" ]] && grep -q "^\[sso-session ${SSO_SESSION}\]" "$CONFIG_FILE"; then
+    tmp=$(mktemp)
+    awk -v sess="[sso-session ${SSO_SESSION}]" '
+      $0 == sess { skip=1; next }
+      /^\[/ { skip=0 }
+      !skip { print }
+    ' "$CONFIG_FILE" > "$tmp"
+    mv "$tmp" "$CONFIG_FILE"
+  fi
+
+  if [[ -f "$CONFIG_FILE" && -s "$CONFIG_FILE" ]]; then
+    echo "" >> "$CONFIG_FILE"
+  fi
+  echo "$config_output" >> "$CONFIG_FILE"
+  echo -e "${green}Appended to ${CONFIG_FILE}${reset}" >&2
+fi
+
+selected_count=$(wc -l < "$selected_file" | tr -d ' ')
+echo -e "${green}${bold}Done! Added ${selected_count} profiles.${reset}" >&2
+echo "" >&2
+echo -e "${dim}To login:  aws sso login --profile <profile-name>${reset}" >&2
+echo -e "${dim}To list:   grep '^\[profile' ~/.aws/config${reset}" >&2
+
+# Cleanup
+rm -f "$entries_file" "$selected_file" 2>/dev/null
