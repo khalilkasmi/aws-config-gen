@@ -7,6 +7,7 @@
 
 import argparse
 import concurrent.futures
+import configparser
 import os
 import re
 import shutil
@@ -33,6 +34,99 @@ def warn(msg): print(f"{C.YELLOW}{msg}{C.RESET}", file=sys.stderr)
 def error(msg): print(f"{C.RED}{msg}{C.RESET}", file=sys.stderr)
 def dim(msg): print(f"{C.DIM}{msg}{C.RESET}", file=sys.stderr)
 def bold(msg): print(f"{C.BOLD}{msg}{C.RESET}", file=sys.stderr)
+
+
+# ── Config Parsing ─────────────────────────────────────────────────
+def parse_aws_config(config_file: str) -> list[dict]:
+    """Parse ~/.aws/config and return a list of profile dicts."""
+    if not os.path.exists(config_file):
+        return []
+
+    config = configparser.ConfigParser()
+    config.read(config_file)
+
+    profiles = []
+    for section in config.sections():
+        if not section.startswith("profile "):
+            continue
+        name = section[len("profile "):]
+        props = dict(config[section])
+        profiles.append({
+            "name": name,
+            "account_id": props.get("sso_account_id", ""),
+            "role_name": props.get("sso_role_name", ""),
+            "region": props.get("region", ""),
+            "sso_start_url": props.get("sso_start_url", ""),
+            "sso_session": props.get("sso_session", ""),
+        })
+    return profiles
+
+
+# ── Login Command ──────────────────────────────────────────────────
+def cmd_login(args):
+    config_file = os.path.expanduser("~/.aws/config")
+    profiles = parse_aws_config(config_file)
+
+    if not profiles:
+        error("No profiles found in ~/.aws/config")
+        error("Run 'aws-config-gen setup --sso-url <url>' first.")
+        sys.exit(1)
+
+    if not shutil.which("fzf"):
+        error("fzf is required. Install with: brew install fzf")
+        sys.exit(1)
+
+    # Build fzf lines
+    lines = []
+    for p in profiles:
+        sso_url = p["sso_start_url"] or p["sso_session"] or ""
+        line = (
+            f"{p['name']}\t"
+            f"{p['name']:<40}  "
+            f"{p['account_id']:<14}  "
+            f"{p['role_name']:<30}  "
+            f"{p['region']:<14}  "
+            f"{sso_url}"
+        )
+        lines.append(line)
+
+    header = (
+        f"{'PROFILE':<40}  "
+        f"{'ACCOUNT ID':<14}  "
+        f"{'ROLE':<30}  "
+        f"{'REGION':<14}  "
+        f"SSO"
+    )
+
+    try:
+        result = subprocess.run(
+            [
+                "fzf",
+                "--header", header,
+                "--prompt", "Login to > ",
+                "--preview-window", "hidden",
+                "--height", "80%",
+                "--reverse",
+                "--delimiter", "\t",
+                "--with-nth", "2",
+            ],
+            input="\n".join(lines),
+            capture_output=True,
+            text=True,
+        )
+    except KeyboardInterrupt:
+        sys.exit(0)
+
+    if result.returncode != 0 or not result.stdout.strip():
+        warn("No profile selected.")
+        sys.exit(0)
+
+    selected = result.stdout.strip().split("\t")[0]
+    print(file=sys.stderr)
+    bold(f"Logging in to: {selected}")
+    print(file=sys.stderr)
+
+    os.execvp("aws", ["aws", "sso", "login", "--profile", selected])
 
 
 # ── SSO Region Detection ────────────────────────────────────────────
@@ -343,25 +437,8 @@ def write_config(
         success(f"Appended to {config_file}")
 
 
-# ── Main ───────────────────────────────────────────────────────────
-def main():
-    parser = argparse.ArgumentParser(
-        prog="aws-config-gen",
-        description="Interactive TUI to discover and generate ~/.aws/config from AWS SSO.",
-    )
-    parser.add_argument("--sso-url", required=True, help="SSO start URL")
-    parser.add_argument("--region", default="eu-west-1", help="Default region (default: eu-west-1)")
-    parser.add_argument("--sso-region", default=None, help="SSO region (defaults to --region)")
-    parser.add_argument("--sso-session", default=None, help="SSO session name")
-    parser.add_argument("--output", default="json", help="Output format (default: json)")
-    parser.add_argument("--profile-format", default="{name}-{role}",
-                        help="Profile naming: {name}, {account}, {role}, {email} (default: {name}-{role})")
-    parser.add_argument("--new", action="store_true", help="Overwrite existing config (backs up first)")
-    parser.add_argument("--dry-run", action="store_true", help="Print config to stdout only")
-    parser.add_argument("--select-all", action="store_true", help="Skip TUI, select all profiles")
-    parser.add_argument("--filter", default=None, help="Pre-filter accounts by pattern")
-
-    args = parser.parse_args()
+# ── Setup Command ─────────────────────────────────────────────────
+def cmd_setup(args):
     sso_url = args.sso_url.rstrip("/")
     config_file = os.path.expanduser("~/.aws/config")
 
@@ -447,8 +524,59 @@ def main():
     count = len(selected)
     success(f"Done! Added {count} profiles.")
     print(file=sys.stderr)
-    dim(f"To login:  aws sso login --profile <profile-name>")
+    dim("To login:  aws-config-gen login")
     dim(r"To list:   grep '^\[profile' ~/.aws/config")
+
+
+# ── Main ───────────────────────────────────────────────────────────
+def main():
+    parser = argparse.ArgumentParser(
+        prog="aws-config-gen",
+        description="Interactive TUI for AWS SSO config management.",
+    )
+    subparsers = parser.add_subparsers(dest="command")
+
+    # ── login ──
+    login_parser = subparsers.add_parser(
+        "login",
+        help="Browse and login to an AWS SSO profile via TUI",
+    )
+    login_parser.set_defaults(func=cmd_login)
+
+    # ── setup ──
+    setup_parser = subparsers.add_parser(
+        "setup",
+        help="Discover SSO accounts/roles and generate ~/.aws/config",
+    )
+    setup_parser.add_argument("--sso-url", required=True, help="SSO start URL")
+    setup_parser.add_argument("--region", default="eu-west-1", help="Default region (default: eu-west-1)")
+    setup_parser.add_argument("--sso-region", default=None, help="SSO region (defaults to auto-detect)")
+    setup_parser.add_argument("--sso-session", default=None, help="SSO session name")
+    setup_parser.add_argument("--output", default="json", help="Output format (default: json)")
+    setup_parser.add_argument("--profile-format", default="{name}-{role}",
+                              help="Profile naming: {name}, {account}, {role}, {email} (default: {name}-{role})")
+    setup_parser.add_argument("--new", action="store_true", help="Overwrite existing config (backs up first)")
+    setup_parser.add_argument("--dry-run", action="store_true", help="Print config to stdout only")
+    setup_parser.add_argument("--select-all", action="store_true", help="Skip TUI, select all profiles")
+    setup_parser.add_argument("--filter", default=None, help="Pre-filter accounts by pattern")
+    setup_parser.set_defaults(func=cmd_setup)
+
+    args = parser.parse_args()
+
+    if not args.command:
+        # Default to login if profiles exist, otherwise show help
+        config_file = os.path.expanduser("~/.aws/config")
+        profiles = parse_aws_config(config_file)
+        if profiles:
+            args.func = cmd_login
+            cmd_login(args)
+        else:
+            parser.print_help()
+            print(file=sys.stderr)
+            dim("Get started: aws-config-gen setup --sso-url <your-sso-url>")
+        return
+
+    args.func(args)
 
 
 if __name__ == "__main__":
