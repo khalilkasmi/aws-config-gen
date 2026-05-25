@@ -126,7 +126,12 @@ def cmd_login(args):
     bold(f"Logging in to: {selected}")
     print(file=sys.stderr)
 
-    login = subprocess.run(["aws", "sso", "login", "--profile", selected])
+    # Redirect aws-cli's stdout to stderr so it doesn't pollute the `eval`-able
+    # output (aws sso login prints the verification URL/code on stdout).
+    login = subprocess.run(
+        ["aws", "sso", "login", "--profile", selected],
+        stdout=sys.stderr,
+    )
     if login.returncode != 0:
         sys.exit(login.returncode)
 
