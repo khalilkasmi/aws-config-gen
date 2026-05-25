@@ -126,7 +126,17 @@ def cmd_login(args):
     bold(f"Logging in to: {selected}")
     print(file=sys.stderr)
 
-    os.execvp("aws", ["aws", "sso", "login", "--profile", selected])
+    login = subprocess.run(["aws", "sso", "login", "--profile", selected])
+    if login.returncode != 0:
+        sys.exit(login.returncode)
+
+    # Emit shell command on stdout so `eval "$(aws-config-gen login)"` sets the
+    # profile in the parent shell. Stderr stays human-readable.
+    print(f'export AWS_PROFILE={selected}')
+    print(file=sys.stderr)
+    success(f"AWS_PROFILE set to: {selected}")
+    dim('Tip: run via  eval "$(aws-config-gen login)"  to export it into your shell.')
+    dim(f'Otherwise:    export AWS_PROFILE={selected}')
 
 
 # ── SSO Region Detection ────────────────────────────────────────────
@@ -524,7 +534,7 @@ def cmd_setup(args):
     count = len(selected)
     success(f"Done! Added {count} profiles.")
     print(file=sys.stderr)
-    dim("To login:  aws-config-gen login")
+    dim('To login:  eval "$(aws-config-gen login)"')
     dim(r"To list:   grep '^\[profile' ~/.aws/config")
 
 
